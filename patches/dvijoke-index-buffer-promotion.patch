@@ -1,0 +1,297 @@
+--- a/d8web/src/backends/webgl2/gl_backend.cpp
++++ b/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -2,6 +2,7 @@
+ // Dumb translator: StateSnapshot + DrawGeometry in, GLES3/WebGL2 calls out.
+ // WebGL2 gaps handled here:
+ //   - no glDrawElementsBaseVertex → base vertex applied via attribute pointer offsets
++//   - fixed primitive restart → 16-bit indices are uploaded as 32-bit values
+ //   - D3D alpha ref (0..255) normalized to [0,1] uniform
+ 
+ #include "../../core/backend.h"
+@@ -16,6 +17,9 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstdint>
++#include <algorithm>
++#include <cstring>
++#include <limits>
+ #include <vector>
+ 
+ // Debug flags. On the web they are page globals (set `window.D8WEB_TRACE = 1`
+@@ -151,6 +155,7 @@
+ 
+ struct Program {
+     GLuint prog = 0;
++    uint8_t activeAttributes = 0;
+     // Uniform locations (‑1 = absent/optimized out)
+     GLint world = -1, view = -1, projection = -1;
+     GLint materialDiffuse = -1, materialAmbient = -1, materialEmissive = -1;
+@@ -168,6 +173,11 @@
+     UINT size = 0;
+     bool dynamic = false;
+     bool live = false;
++    UINT indexSize = 0; // Source bytes per index, zero for a vertex buffer.
++    GLsizeiptr gpuSize = 0;
++    // Backend-owned source bytes: frontend locks can update arbitrary byte
++    // spans, so conversion cannot rely on the transient update pointer alone.
++    std::vector<uint8_t> indexBytes;
+ };
+ 
+ struct TextureSlot {
+@@ -291,22 +301,56 @@
+     }
+ 
+     BackendHandle createBuffer(BufferKind kind, UINT byteSize, bool dynamic) override {
++        m_lastError = nullptr;
+         BufferSlot slot;
++        if (kind != BufferKind::Vertex && kind != BufferKind::Index16 && kind != BufferKind::Index32) {
++            fail("Unknown buffer kind"); return 0;
++        }
++        slot.indexSize = kind == BufferKind::Index16 ? 2 : kind == BufferKind::Index32 ? 4 : 0;
++        const uint64_t gpuSize = slot.indexSize == 2 ? ((uint64_t(byteSize) + 1) / 2) * 4 : byteSize;
++        if (!byteSize || gpuSize > uint64_t(std::numeric_limits<GLsizeiptr>::max())) {
++            fail("Buffer size exceeds the WebGL addressable range"); return 0;
++        }
+         slot.target = (kind == BufferKind::Vertex) ? GL_ARRAY_BUFFER : GL_ELEMENT_ARRAY_BUFFER;
+         slot.size = byteSize;
++        slot.gpuSize = GLsizeiptr(gpuSize);
+         slot.dynamic = dynamic;
+         slot.live = true;
++        if (slot.indexSize) slot.indexBytes.resize(byteSize, 0);
+         glGenBuffers(1, &slot.gl);
+         glBindBuffer(slot.target, slot.gl);
+-        glBufferData(slot.target, byteSize, nullptr, dynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
++        glBufferData(slot.target, slot.gpuSize, nullptr, dynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
+         if (slot.target == GL_ELEMENT_ARRAY_BUFFER) m_boundIB = slot.gl;  // VAO captured it
+         return store(m_buffers, slot);
+     }
+ 
+     void updateBuffer(BackendHandle h, UINT offset, const void* data, UINT size, bool discard) override {
++        m_lastError = nullptr;
++        if (!h || h > m_buffers.size() || !m_buffers[h - 1].live) { fail("Invalid buffer handle"); return; }
+         BufferSlot& b = m_buffers[h - 1];
++        if (offset > b.size || size > b.size - offset || (size && !data)) { fail("Buffer update is out of bounds"); return; }
+         glBindBuffer(b.target, b.gl);
+         if (b.target == GL_ELEMENT_ARRAY_BUFFER) m_boundIB = b.gl;
++        if (b.indexSize) {
++            // DISCARD invalidates all old contents. WebGL buffer allocation is
++            // zero-initialized; keep the CPU view consistent with that choice.
++            if (discard) std::fill(b.indexBytes.begin(), b.indexBytes.end(), 0);
++            if (size) std::memcpy(b.indexBytes.data() + offset, data, size);
++            if (b.indexSize == 2) {
++                const size_t first = discard ? 0 : offset / 2;
++                const size_t end = discard ? (uint64_t(b.size) + 1) / 2 : (uint64_t(offset) + size + 1) / 2;
++                std::vector<uint32_t> widened(end - first);
++                for (size_t i = first; i < end; ++i) widened[i - first] = indexValue(b, i);
++                if (discard) glBufferData(b.target, b.gpuSize, widened.data(),
++                                         b.dynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
++                else if (size) glBufferSubData(b.target, GLintptr(first * 4), GLsizeiptr(widened.size() * 4), widened.data());
++            } else if (discard) {
++                glBufferData(b.target, b.gpuSize, b.indexBytes.data(), b.dynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
++            } else if (size) {
++                glBufferSubData(b.target, offset, size, data);
++            }
++            return;
++        }
+         if (discard && offset == 0 && size == b.size) {
+             glBufferData(b.target, b.size, data, b.dynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
+         } else {
+@@ -317,9 +361,12 @@
+     }
+ 
+     void destroyBuffer(BackendHandle h) override {
++        m_lastError = nullptr;
++        if (!h || h > m_buffers.size() || !m_buffers[h - 1].live) { fail("Invalid buffer handle"); return; }
+         BufferSlot& b = m_buffers[h - 1];
+         if (b.live) glDeleteBuffers(1, &b.gl);
+         b.live = false;
++        std::vector<uint8_t>().swap(b.indexBytes);
+     }
+ 
+     BackendHandle createTexture(UINT width, UINT height, UINT levels, TexFormat format) override {
+@@ -422,6 +469,7 @@
+ 
+     void clear(bool color, bool depth, bool stencil,
+                D3DCOLOR argb, float z, DWORD stencilValue) override {
++        m_lastError = nullptr;
+         GLbitfield mask = 0;
+         if (color) {
+             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+@@ -456,17 +504,36 @@
+     }
+ 
+     void draw(const DrawGeometry& geo, const StateSnapshot& s, const ShaderKey& key) override {
++        m_lastError = nullptr;
++        if (geo.primitive < D3DPT_POINTLIST || geo.primitive > D3DPT_TRIANGLEFAN) { fail("Unknown primitive type"); return; }
++        const uint64_t vertexCount = geo.primCount == 0 ? 0 : vertexCountFor(geo.primitive, geo.primCount);
++        if (!vertexCount) return;
++        if (vertexCount > uint64_t(std::numeric_limits<GLsizei>::max())) { fail("Draw count exceeds the WebGL range"); return; }
++        if (!geo.vb || geo.vb > m_buffers.size() || !m_buffers[geo.vb - 1].live || m_buffers[geo.vb - 1].indexSize) {
++            fail("Invalid vertex buffer"); return;
++        }
++        uint32_t maximumIndex = 0;
++        if (geo.ib) {
++            if (geo.ib > m_buffers.size() || !m_buffers[geo.ib - 1].live) { fail("Invalid index buffer"); return; }
++            const BufferSlot& ib = m_buffers[geo.ib - 1];
++            if (ib.indexSize != (geo.index32 ? 4u : 2u)) { fail("Index buffer format does not match the draw"); return; }
++            if ((uint64_t(geo.startIndex) + vertexCount) * ib.indexSize > ib.size) { fail("Index draw range is out of bounds"); return; }
++            for (uint64_t i = 0; i < vertexCount; ++i) maximumIndex = std::max(maximumIndex, indexValue(ib, uint64_t(geo.startIndex) + i));
++            if (maximumIndex == 0xffffffffu) { fail("32-bit index 0xffffffff is not a representable WebGL vertex index"); return; }
++        } else {
++            if (geo.startVertex > UINT(std::numeric_limits<GLint>::max()) ||
++                uint64_t(geo.startVertex) + vertexCount - 1 > 0xffffffffu) { fail("Vertex draw range is out of bounds"); return; }
++            maximumIndex = UINT(uint64_t(geo.startVertex) + vertexCount - 1);
++        }
+         const Program& prog = getProgram(key);
+-        if (!prog.prog) return;
++        if (!prog.prog) { fail("Draw shader program is unavailable"); return; }
++        if (!vertexFetchesFit(geo, prog, maximumIndex)) { fail("Index references vertex attributes outside the bound vertex buffer"); return; }
+         glUseProgram(prog.prog);
+ 
+         applyFixedState(s, key);
+         uploadUniforms(prog, s, key);
+         bindTextures(prog, s, key);
+         bindGeometry(geo);
+-
+-        const UINT vertexCount = geo.primCount == 0 ? 0 : vertexCountFor(geo.primitive, geo.primCount);
+-        if (vertexCount == 0) return;
+ 
+         ++m_drawCount;
+         // The first draw always logs, trace flag or not — the player page
+@@ -475,12 +542,14 @@
+             std::fprintf(stderr, "[d8web] draw #1 — first frame\n");
+         else if (d8webTrace() && (m_drawCount <= 5 || m_drawCount % 500 == 0))
+             std::fprintf(stderr, "[d8web] draw #%llu prim=%d verts=%u tex0=%u prog=%u cull=%u rhw=%d\n",
+-                         (unsigned long long)m_drawCount, int(geo.primitive), vertexCount,
++                         (unsigned long long)m_drawCount, int(geo.primitive), UINT(vertexCount),
+                          s.textures[0], prog.prog, s.rs[D3DRS_CULLMODE], int(key.preTransformed));
+ 
+         if (geo.ib) {
+-            GLenum type = geo.index32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
+-            UINT indexSize = geo.index32 ? 4 : 2;
++            // INDEX16 storage is widened on upload. 65535 remains an ordinary
++            // vertex index instead of WebGL2's fixed UNSIGNED_SHORT restart.
++            constexpr GLenum type = GL_UNSIGNED_INT;
++            constexpr UINT indexSize = 4;
+             // WebGL2 supports indexed TRIANGLE_FAN directly. The same count,
+             // byte index offset and attribute-based base vertex apply to fans
+             // as to the other indexed primitive modes.
+@@ -501,8 +570,42 @@
+     }
+ 
+     const char* name() const override { return "webgl2"; }
++    const char* lastError() const override { return m_lastError; }
+ 
+ private:
++    void fail(const char* message) {
++        m_lastError = message;
++        std::fprintf(stderr, "[d8web] %s\n", message);
++    }
++
++    static uint32_t indexValue(const BufferSlot& buffer, uint64_t index) {
++        const uint64_t offset = index * buffer.indexSize;
++        uint32_t value = 0;
++        for (UINT i = 0; i < buffer.indexSize && offset + i < buffer.indexBytes.size(); ++i)
++            value |= uint32_t(buffer.indexBytes[size_t(offset + i)]) << (i * 8);
++        return value;
++    }
++
++    bool vertexFetchesFit(const DrawGeometry& geo, const Program& program, uint32_t maximumIndex) const {
++        const BufferSlot& vb = m_buffers[geo.vb - 1];
++        const VertexLayout& layout = geo.layout;
++        auto fits = [&](unsigned attribute, bool enabled, UINT offset, UINT bytes) {
++            if (!enabled || !(program.activeAttributes & (1u << attribute))) return true;
++            const uint64_t first = uint64_t(geo.baseVertexIndex) * geo.vbStride + offset;
++            if (first > vb.size || bytes > uint64_t(vb.size) - first) return false;
++            // GL stride zero means tightly packed for EACH active attribute.
++            // Do not require an unused final record's padding to exist.
++            const uint64_t stride = geo.vbStride ? geo.vbStride : bytes;
++            return maximumIndex <= (uint64_t(vb.size) - first - bytes) / stride;
++        };
++        if (!fits(0, layout.xyz || layout.xyzrhw, layout.offsetPosition, layout.xyzrhw ? 16 : 12) ||
++            !fits(1, layout.normal, layout.offsetNormal, 12) ||
++            !fits(2, layout.diffuse, layout.offsetDiffuse, 4)) return false;
++        for (int i = 0; i < 4; ++i)
++            if (!fits(unsigned(3 + i), i < layout.texCoordSets, layout.offsetTex0 + UINT(i) * 8, 8)) return false;
++        return true;
++    }
++
+     template <typename T>
+     static BackendHandle store(std::vector<T>& vec, const T& v) {
+         for (size_t i = 0; i < vec.size(); ++i) {
+@@ -512,14 +615,14 @@
+         return BackendHandle(vec.size());
+     }
+ 
+-    static UINT vertexCountFor(D3DPRIMITIVETYPE t, UINT prims) {
++    static uint64_t vertexCountFor(D3DPRIMITIVETYPE t, UINT prims) {
+         switch (t) {
+             case D3DPT_POINTLIST: return prims;
+-            case D3DPT_LINELIST: return prims * 2;
+-            case D3DPT_LINESTRIP: return prims + 1;
+-            case D3DPT_TRIANGLELIST: return prims * 3;
+-            case D3DPT_TRIANGLESTRIP: return prims + 2;
+-            case D3DPT_TRIANGLEFAN: return prims + 2;
++            case D3DPT_LINELIST: return uint64_t(prims) * 2;
++            case D3DPT_LINESTRIP: return uint64_t(prims) + 1;
++            case D3DPT_TRIANGLELIST: return uint64_t(prims) * 3;
++            case D3DPT_TRIANGLESTRIP: return uint64_t(prims) + 2;
++            case D3DPT_TRIANGLEFAN: return uint64_t(prims) + 2;
+         }
+         return 0;
+     }
+@@ -562,6 +665,9 @@
+         if (fs) glDeleteShader(fs);
+ 
+         if (p.prog) {
++            const char* attributes[] = {"aPosition", "aNormal", "aColor", "aTex0", "aTex1", "aTex2", "aTex3"};
++            for (unsigned i = 0; i < 7; ++i)
++                if (glGetAttribLocation(p.prog, attributes[i]) >= 0) p.activeAttributes |= uint8_t(1u << i);
+             auto loc = [&](const char* n) { return glGetUniformLocation(p.prog, n); };
+             p.world = loc("uWorld"); p.view = loc("uView"); p.projection = loc("uProjection");
+             p.materialDiffuse = loc("uMaterialDiffuse");
+@@ -794,6 +900,7 @@
+     uint64_t m_drawCount = 0;
+     uint64_t m_clearCount = 0;
+     uint64_t m_texUploads = 0;
++    const char* m_lastError = nullptr;
+     bool m_s3tc = true;
+     D3DVIEWPORT8 m_viewport{};
+     std::vector<BufferSlot> m_buffers;
+--- a/d8web/src/core/backend.h
++++ b/d8web/src/core/backend.h
+@@ -66,6 +66,10 @@
+ 
+     // Diagnostics
+     virtual const char* name() const = 0;
++    // Optional operation failure detail for custom renderer bridges. Existing
++    // D3D8 frontend HRESULTs do not yet consume this diagnostic. Successful
++    // buffer/clear/draw operations clear it; inspection does not clear it.
++    virtual const char* lastError() const { return nullptr; }
+ };
+ 
+ // Factory implemented per backend translation unit
+--- a/d8web/src/frontend/device.cpp
++++ b/d8web/src/frontend/device.cpp
+@@ -804,11 +804,12 @@
+         return m_scratchVB;
+     }
+     BackendHandle scratchIB(const void* data, UINT size, bool i32) {
+-        if (size > m_scratchIBSize) {
++        if (size > m_scratchIBSize || i32 != m_scratchIB32) {
+             if (m_scratchIB) m_backend->destroyBuffer(m_scratchIB);
+             m_scratchIBSize = std::max(size, 16u * 1024);
+             m_scratchIB = m_backend->createBuffer(i32 ? BufferKind::Index32 : BufferKind::Index16,
+                                                   m_scratchIBSize, true);
++            m_scratchIB32 = i32;
+         }
+         m_backend->updateBuffer(m_scratchIB, 0, data, size, true);
+         return m_scratchIB;
+@@ -842,6 +843,7 @@
+     UINT m_baseVertexIndex = 0;
+     BackendHandle m_scratchVB = 0, m_scratchIB = 0;
+     UINT m_scratchVBSize = 0, m_scratchIBSize = 0;
++    bool m_scratchIB32 = false;
+ };
+ 
+ // ---------- IDirect3D8 ----------

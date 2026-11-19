@@ -1,0 +1,354 @@
+--- a/d8web/src/backends/webgl2/gl_backend.cpp
++++ b/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -20,6 +20,7 @@
+ #include <algorithm>
+ #include <cstring>
+ #include <limits>
++#include <string>
+ #include <vector>
+ 
+ // Debug flags. On the web they are page globals (set `window.D8WEB_TRACE = 1`
+@@ -189,9 +190,14 @@
+     // GL_TEXTURE_MAX_LEVEL is clamped to the contiguous-from-0 uploaded range.
+     uint32_t uploadedMask = 0;
+     int appliedMaxLevel = -1;
+-    // Last-applied sampler params, to skip redundant glTexParameteri
++    bool live = false;
++};
++
++// D3D sampler state belongs to a texture stage, not the texture resource.
++// One texture may be bound to both stages with different wrapping/filtering.
++struct SamplerSlot {
++    GLuint gl = 0;
+     DWORD addrU = 0, addrV = 0, magF = 0, minF = 0, mipF = 0;
+-    bool live = false;
+ };
+ 
+ GLuint compile(GLenum type, const std::string& src) {
+@@ -244,15 +250,36 @@
+ GLenum glWrap(DWORD a) {
+     switch (a) {
+         case D3DTADDRESS_MIRROR: return GL_MIRRORED_REPEAT;
+-        case D3DTADDRESS_CLAMP:
+-        case D3DTADDRESS_BORDER: return GL_CLAMP_TO_EDGE;  // border color approximated
++        case D3DTADDRESS_CLAMP: return GL_CLAMP_TO_EDGE;
+         default: return GL_REPEAT;
+     }
+ }
+ 
+ class WebGL2Backend final : public IBackend {
+ public:
++    explicit WebGL2Backend(const char* selector) : m_canvasSelector(selector ? selector : "") {}
++
++    ~WebGL2Backend() override {
++#ifdef __EMSCRIPTEN__
++        if (m_ctx <= 0) return;
++        const auto previous = emscripten_webgl_get_current_context();
++        // Never delete another backend's objects when it owns the current
++        // context. Lost/unavailable contexts cannot receive GL cleanup calls.
++        if (emscripten_webgl_make_context_current(m_ctx) == EMSCRIPTEN_RESULT_SUCCESS)
++            releaseGLResources();
++        emscripten_webgl_make_context_current(previous == m_ctx ? 0 : previous);
++        emscripten_webgl_destroy_context(m_ctx);
++#else
++        if (m_initialized) releaseGLResources();
++#endif
++    }
++
+     bool init(int width, int height) override {
++        m_lastError = nullptr;
++        if (m_initialized) { fail("Backend is already initialized"); return false; }
++        if (width <= 0 || height <= 0 || m_canvasSelector.empty()) {
++            fail("Invalid canvas selector or dimensions"); return false;
++        }
+ #ifdef __EMSCRIPTEN__
+         EmscriptenWebGLContextAttributes attrs;
+         emscripten_webgl_init_context_attributes(&attrs);
+@@ -265,12 +292,17 @@
+         // Keep the rendered frame readable between RAF ticks (screenshots, and
+         // some browsers otherwise clear on composite).
+         attrs.preserveDrawingBuffer = true;
+-        m_ctx = emscripten_webgl_create_context("#canvas", &attrs);
++        m_ctx = emscripten_webgl_create_context(m_canvasSelector.c_str(), &attrs);
+         if (m_ctx <= 0) {
+             std::fprintf(stderr, "[d8web] WebGL2 context creation failed (%ld)\n", (long)m_ctx);
+             return false;
+         }
+-        emscripten_webgl_make_context_current(m_ctx);
++        if (emscripten_webgl_make_context_current(m_ctx) != EMSCRIPTEN_RESULT_SUCCESS) {
++            fail("WebGL2 context could not be made current");
++            emscripten_webgl_destroy_context(m_ctx);
++            m_ctx = 0;
++            return false;
++        }
+         // DXT texture support is an extension WebGL only activates on request
+         bool s3tc = emscripten_webgl_enable_extension(m_ctx, "WEBGL_compressed_texture_s3tc");
+         // D8WEB_NO_S3TC (page: window.D8WEB_NO_S3TC = 1) forces the CPU decode
+@@ -287,6 +319,8 @@
+         m_height = height;
+         glGenVertexArrays(1, &m_vao);
+         glBindVertexArray(m_vao);
++        for (auto& sampler : m_samplers) glGenSamplers(1, &sampler.gl);
++        m_initialized = true;
+         glDisable(GL_DITHER);
+         // D3D convention: clockwise = front when culling CCW-off; we translate cull
+         // mode per draw, base winding stays GL default (CCW front).
+@@ -370,6 +404,17 @@
+     }
+ 
+     BackendHandle createTexture(UINT width, UINT height, UINT levels, TexFormat format) override {
++        m_lastError = nullptr;
++        if (!width || !height || !textureBytes(format, width, height)) {
++            fail("Invalid texture dimensions or format"); return 0;
++        }
++        GLint maxSize = 0;
++        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxSize);
++        UINT maximumLevels = 1;
++        for (UINT size = std::max(width, height); size > 1; size >>= 1) ++maximumLevels;
++        if (width > UINT(maxSize) || height > UINT(maxSize) || levels > maximumLevels) {
++            fail("Texture dimensions or mip count exceed WebGL limits"); return 0;
++        }
+         TextureSlot t;
+         t.width = width; t.height = height;
+         t.levels = levels ? levels : 1;
+@@ -390,19 +435,37 @@
+         if (format != TexFormat::DXT1 && format != TexFormat::DXT3 && format != TexFormat::DXT5)
+             glTexStorage2D(GL_TEXTURE_2D, GLsizei(t.levels), internal, width, height);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, GLint(t.levels - 1));
++        if (glGetError() != GL_NO_ERROR || !t.gl) {
++            if (t.gl) glDeleteTextures(1, &t.gl);
++            fail("WebGL texture allocation failed"); return 0;
++        }
+         return store(m_textures, t);
+     }
+ 
+     void updateTexture(BackendHandle h, UINT level, UINT width, UINT height,
+                        TexFormat format, const void* data, UINT byteSize) override {
++        m_lastError = nullptr;
++        if (!h || h > m_textures.size() || !m_textures[h - 1].live) {
++            fail("Invalid texture handle"); return;
++        }
+         TextureSlot& t = m_textures[h - 1];
+-        if (level < 32) t.uploadedMask |= (1u << level);
++        if (level >= t.levels || level >= 32 || format != t.format ||
++            width != std::max(1u, t.width >> level) || height != std::max(1u, t.height >> level) ||
++            !data || uint64_t(byteSize) != textureBytes(format, width, height)) {
++            fail("Texture upload format, level, dimensions or byte count do not match allocation"); return;
++        }
++        BYTE first[4]{};
++        std::memcpy(first, data, std::min(UINT(sizeof(first)), byteSize));
+         if (++m_texUploads <= 8)
+             std::fprintf(stderr, "[d8web] texUpload #%llu h=%u lvl=%u %ux%u fmt=%d bytes=%u first=%02X%02X%02X%02X\n",
+                          (unsigned long long)m_texUploads, h, level, width, height, int(format),
+-                         byteSize, ((const BYTE*)data)[0], ((const BYTE*)data)[1],
+-                         ((const BYTE*)data)[2], ((const BYTE*)data)[3]);
++                         byteSize, first[0], first[1], first[2], first[3]);
+         glBindTexture(GL_TEXTURE_2D, t.gl);
++        GLint previousUnpackAlignment = 0;
++        glGetIntegerv(GL_UNPACK_ALIGNMENT, &previousUnpackAlignment);
++        // The bridge supplies tightly packed rows, including odd-width 16-bit
++        // and single-channel mip levels. Do not leak pixel-store state.
++        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+         switch (format) {
+             case TexFormat::RGBA8:
+                 glTexSubImage2D(GL_TEXTURE_2D, GLint(level), 0, 0, width, height,
+@@ -451,9 +514,16 @@
+                 break;
+             }
+         }
++        glPixelStorei(GL_UNPACK_ALIGNMENT, previousUnpackAlignment);
++        if (glGetError() != GL_NO_ERROR) { fail("WebGL texture upload failed"); return; }
++        t.uploadedMask |= (1u << level);
+     }
+ 
+     void destroyTexture(BackendHandle h) override {
++        m_lastError = nullptr;
++        if (!h || h > m_textures.size() || !m_textures[h - 1].live) {
++            fail("Invalid texture handle"); return;
++        }
+         TextureSlot& t = m_textures[h - 1];
+         if (t.live) glDeleteTextures(1, &t.gl);
+         t.live = false;
+@@ -532,7 +602,7 @@
+ 
+         applyFixedState(s, key);
+         uploadUniforms(prog, s, key);
+-        bindTextures(prog, s, key);
++        if (!bindTextures(prog, s, key)) return;
+         bindGeometry(geo);
+ 
+         ++m_drawCount;
+@@ -573,6 +643,40 @@
+     const char* lastError() const override { return m_lastError; }
+ 
+ private:
++    static uint64_t textureBytes(TexFormat format, UINT width, UINT height) {
++        const uint64_t pixels = uint64_t(width) * height;
++        switch (format) {
++            case TexFormat::RGBA8: return pixels * 4;
++            case TexFormat::RGB565:
++            case TexFormat::RGBA4:
++            case TexFormat::RGB5A1:
++            case TexFormat::A8L8: return pixels * 2;
++            case TexFormat::L8: return pixels;
++            case TexFormat::DXT1: return ((uint64_t(width) + 3) / 4) * ((uint64_t(height) + 3) / 4) * 8;
++            case TexFormat::DXT3:
++            case TexFormat::DXT5: return ((uint64_t(width) + 3) / 4) * ((uint64_t(height) + 3) / 4) * 16;
++        }
++        return 0;
++    }
++
++    void releaseGLResources() {
++        glUseProgram(0);
++        glBindVertexArray(0);
++        for (auto& buffer : m_buffers) {
++            if (buffer.live) glDeleteBuffers(1, &buffer.gl);
++            buffer.live = false;
++        }
++        for (auto& texture : m_textures) {
++            if (texture.live) glDeleteTextures(1, &texture.gl);
++            texture.live = false;
++        }
++        for (const auto& entry : m_programs)
++            if (entry.second.prog) glDeleteProgram(entry.second.prog);
++        if (m_vao) glDeleteVertexArrays(1, &m_vao);
++        for (auto& sampler : m_samplers)
++            if (sampler.gl) glDeleteSamplers(1, &sampler.gl);
++    }
++
+     void fail(const char* message) {
+         m_lastError = message;
+         std::fprintf(stderr, "[d8web] %s\n", message);
+@@ -815,48 +919,75 @@
+         }
+     }
+ 
+-    void bindTextures(const Program& p, const StateSnapshot& s, const ShaderKey& key) {
++    bool bindTextures(const Program& p, const StateSnapshot& s, const ShaderKey& key) {
++        // Validate first: an unsupported sampler must not submit a draw with an
++        // approximation such as BORDER -> CLAMP_TO_EDGE.
++        for (int i = 0; i < kActiveStages; ++i) {
++            if (!key.stages[i].bound || p.tex[i] < 0) continue;
++            const auto handle = s.textures[i];
++            if (!handle || handle > m_textures.size() || !m_textures[handle - 1].live) {
++                fail("Invalid texture handle"); return false;
++            }
++            const auto& values = s.stages[i].values;
++            auto addressSupported = [](DWORD value) {
++                return value == D3DTADDRESS_WRAP || value == D3DTADDRESS_MIRROR || value == D3DTADDRESS_CLAMP;
++            };
++            if (!addressSupported(values[D3DTSS_ADDRESSU]) || !addressSupported(values[D3DTSS_ADDRESSV])) {
++                fail("Unsupported texture address mode (BORDER is not implemented)"); return false;
++            }
++            auto filterSupported = [](DWORD value) { return value == D3DTEXF_POINT || value == D3DTEXF_LINEAR; };
++            if (!filterSupported(values[D3DTSS_MAGFILTER]) || !filterSupported(values[D3DTSS_MINFILTER]) ||
++                (values[D3DTSS_MIPFILTER] != D3DTEXF_NONE && !filterSupported(values[D3DTSS_MIPFILTER]))) {
++                fail("Unsupported texture filter"); return false;
++            }
++        }
+         for (int i = 0; i < kActiveStages; ++i) {
+             if (!key.stages[i].bound || p.tex[i] < 0) continue;
+             glActiveTexture(GLenum(GL_TEXTURE0 + i));
+             TextureSlot& t = m_textures[s.textures[i] - 1];
+             glBindTexture(GL_TEXTURE_2D, t.gl);
+             glUniform1i(p.tex[i], i);
+-            applySampler(t, s.stages[i]);
+-        }
+-    }
+-
+-    void applySampler(TextureSlot& t, const StageState& st) {
++            applySampler(m_samplers[i], s.stages[i]);
++            glBindSampler(GLuint(i), m_samplers[i].gl);
++
++            // The uploaded mip range belongs to the texture, independently of
++            // how each stage samples it. Sampling cannot expose unwritten mips.
++            int maxLevel = 0;
++            while (maxLevel + 1 < int(t.levels) && maxLevel + 1 < 32 &&
++                   ((t.uploadedMask >> (maxLevel + 1)) & 1u)) ++maxLevel;
++            if (maxLevel != t.appliedMaxLevel) {
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, maxLevel);
++                t.appliedMaxLevel = maxLevel;
++            }
++        }
++        return true;
++    }
++
++    void applySampler(SamplerSlot& sampler, const StageState& st) {
+         DWORD aU = st.values[D3DTSS_ADDRESSU], aV = st.values[D3DTSS_ADDRESSV];
+         DWORD mag = st.values[D3DTSS_MAGFILTER], min = st.values[D3DTSS_MINFILTER],
+               mip = st.values[D3DTSS_MIPFILTER];
+-        if (aU != t.addrU) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GLint(glWrap(aU))); t.addrU = aU; }
+-        if (aV != t.addrV) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GLint(glWrap(aV))); t.addrV = aV; }
+-        if (mag != t.magF) {
+-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+-                            mag == D3DTEXF_POINT ? GL_NEAREST : GL_LINEAR);
+-            t.magF = mag;
+-        }
+-        if (min != t.minF || mip != t.mipF) {
++        if (aU != sampler.addrU) {
++            glSamplerParameteri(sampler.gl, GL_TEXTURE_WRAP_S, GLint(glWrap(aU))); sampler.addrU = aU;
++        }
++        if (aV != sampler.addrV) {
++            glSamplerParameteri(sampler.gl, GL_TEXTURE_WRAP_T, GLint(glWrap(aV))); sampler.addrV = aV;
++        }
++        if (mag != sampler.magF) {
++            glSamplerParameteri(sampler.gl, GL_TEXTURE_MAG_FILTER, mag == D3DTEXF_POINT ? GL_NEAREST : GL_LINEAR);
++            sampler.magF = mag;
++        }
++        if (min != sampler.minF || mip != sampler.mipF) {
+             GLint f;
+-            bool mips = t.levels > 1 && mip != D3DTEXF_NONE;
++            const bool mips = mip != D3DTEXF_NONE;
+             if (min == D3DTEXF_POINT)
+                 f = mips ? (mip == D3DTEXF_POINT ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_LINEAR)
+                          : GL_NEAREST;
+             else
+                 f = mips ? (mip == D3DTEXF_POINT ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR)
+                          : GL_LINEAR;
+-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+-            t.minF = min; t.mipF = mip;
+-        }
+-
+-        // Clamp mip sampling to the levels the app actually uploaded — the rest
+-        // of the chain is zero-filled (black) and must never be sampled.
+-        int maxLevel = 0;
+-        while (maxLevel + 1 < int(t.levels) && (t.uploadedMask >> (maxLevel + 1)) & 1u) ++maxLevel;
+-        if (maxLevel != t.appliedMaxLevel) {
+-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, maxLevel);
+-            t.appliedMaxLevel = maxLevel;
++            glSamplerParameteri(sampler.gl, GL_TEXTURE_MIN_FILTER, f);
++            sampler.minF = min; sampler.mipF = mip;
+         }
+     }
+ 
+@@ -892,6 +1023,9 @@
+ #ifdef __EMSCRIPTEN__
+     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE m_ctx = 0;
+ #endif
++    std::string m_canvasSelector;
++    bool m_initialized = false;
++    SamplerSlot m_samplers[kActiveStages];
+     int m_width = 0, m_height = 0;
+     GLuint m_vao = 0;
+     GLuint m_boundIB = 0;
+@@ -910,6 +1044,7 @@
+ 
+ }  // namespace
+ 
+-IBackend* createWebGL2Backend() { return new WebGL2Backend(); }
++IBackend* createWebGL2BackendForCanvas(const char* selector) { return new WebGL2Backend(selector); }
++IBackend* createWebGL2Backend() { return createWebGL2BackendForCanvas("#canvas"); }
+ 
+ }  // namespace d8web
+--- a/d8web/src/core/backend.h
++++ b/d8web/src/core/backend.h
+@@ -74,6 +74,9 @@
+ 
+ // Factory implemented per backend translation unit
+ IBackend* createWebGL2Backend();
++// Copies the caller's selector; init() creates and owns its WebGL context.
++// Destruction releases its GL objects and restores any other current context.
++IBackend* createWebGL2BackendForCanvas(const char* selector);
+ // IBackend* createWebGPUBackend();   // v2
+ 
+ }  // namespace d8web

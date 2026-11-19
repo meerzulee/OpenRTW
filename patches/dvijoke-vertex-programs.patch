@@ -1,0 +1,337 @@
+diff --git i/d8web/src/backends/webgl2/gl_backend.cpp w/d8web/src/backends/webgl2/gl_backend.cpp
+index d414be1..deefe90 100644
+--- i/d8web/src/backends/webgl2/gl_backend.cpp
++++ w/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -156,7 +156,9 @@ static void d8webDecodeDXT(TexFormat fmt, UINT width, UINT height,
+ 
+ struct Program {
+     GLuint prog = 0;
+-    uint8_t activeAttributes = 0;
++    uint32_t activeAttributes = 0;
++    GLint vertexConstants=-1, vertexConstantCount=-1;
++    GLint vertexTexCoordIndex[2]={-1,-1};
+     // Uniform locations (‑1 = absent/optimized out)
+     GLint world = -1, view = -1, projection = -1;
+     GLint materialDiffuse = -1, materialAmbient = -1, materialEmissive = -1;
+@@ -169,6 +171,14 @@ struct Program {
+     struct { GLint pos = -1, diffuse = -1, atten = -1, range = -1; } pointLights[4];
+ };
+ 
++struct VertexProgramSlot {
++    GLuint shader=0;
++    bool live=false;
++    UINT constantCount=0;
++    std::vector<VertexAttribute> attributes;
++    std::unordered_map<ShaderKey, Program, ShaderKeyHash> programs;
++};
++
+ struct BufferSlot {
+     GLuint gl = 0;
+     GLenum target = GL_ARRAY_BUFFER;
+@@ -595,6 +605,64 @@ public:
+         glDisable(GL_SCISSOR_TEST);
+     }
+ 
++    BackendHandle createVertexProgram(const char* source, const VertexAttribute* attributes,
++            UINT count, UINT constants) override {
++        m_lastError=nullptr;
++        if (!source || (count&&!attributes) || count>16 || !constants || constants>8192) {
++            fail("Invalid programmable vertex inputs"); return 0;
++        }
++        uint32_t seen=0;
++        for (UINT i=0;i<count;i++) {
++            const auto& a=attributes[i];
++            if (a.registerIndex>=16 || a.type>4 || a.reserved || a.offset>255 ||
++                    (seen&(1u<<a.registerIndex))) { fail("Invalid vertex declaration attribute"); return 0; }
++            seen|=1u<<a.registerIndex;
++        }
++        size_t reusable=m_vertexPrograms.size();
++        for (size_t i=0;i<m_vertexPrograms.size();i++) if (!m_vertexPrograms[i].live) { reusable=i; break; }
++        if (reusable==m_vertexPrograms.size() && reusable>=4096) { fail("Vertex program slot limit exceeded"); return 0; }
++        GLuint shader=compile(GL_VERTEX_SHADER,std::string(source));
++        if (!shader) { fail("Programmable vertex shader compilation failed"); return 0; }
++        if (!ensureVertexConstants()) { glDeleteShader(shader); return 0; }
++        VertexProgramSlot slot; slot.shader=shader; slot.live=true; slot.constantCount=constants;
++        try {
++            if (count) slot.attributes.assign(attributes,attributes+count);
++            if (reusable<m_vertexPrograms.size()) m_vertexPrograms[reusable]=std::move(slot);
++            else m_vertexPrograms.push_back(std::move(slot));
++        } catch (...) { glDeleteShader(shader); throw; }
++        return BackendHandle(reusable+1);
++    }
++
++    bool destroyVertexProgram(BackendHandle handle) override {
++        m_lastError=nullptr;
++        if (!handle || handle>m_vertexPrograms.size() || !m_vertexPrograms[handle-1].live) {
++            fail("Invalid programmable vertex handle"); return false;
++        }
++        auto& slot=m_vertexPrograms[handle-1];
++        for (auto& item:slot.programs) if (item.second.prog) glDeleteProgram(item.second.prog);
++        glDeleteShader(slot.shader);
++        slot=VertexProgramSlot{}; return true;
++    }
++
++    bool updateVertexConstants(UINT start,const float* data,UINT count) override {
++        m_lastError=nullptr;
++        if (start>8192 || count>8192-start || (count&&!data)) {
++            fail("Vertex constant range exceeds the internal bank"); return false;
++        }
++        if (!count) return true;
++        if (!ensureVertexConstants()) return false;
++        glActiveTexture(GL_TEXTURE0+kActiveStages);
++        glBindTexture(GL_TEXTURE_2D,m_vertexConstants);
++        glBindSampler(kActiveStages,0);
++        for (UINT done=0;done<count;) {
++            const UINT at=start+done, n=std::min(count-done,128u-at%128u);
++            glTexSubImage2D(GL_TEXTURE_2D,0,GLint(at%128u),GLint(at/128u),GLsizei(n),1,
++                    GL_RGBA,GL_FLOAT,data+size_t(done)*4); done+=n;
++        }
++        if (glGetError()!=GL_NO_ERROR) { fail("Vertex constant upload failed"); return false; }
++        return true;
++    }
++
+     void draw(const DrawGeometry& geo, const StateSnapshot& s, const ShaderKey& key) override {
+         m_lastError = nullptr;
+         if (geo.primitive < D3DPT_POINTLIST || geo.primitive > D3DPT_TRIANGLEFAN) { fail("Unknown primitive type"); return; }
+@@ -617,16 +685,37 @@ public:
+                 uint64_t(geo.startVertex) + vertexCount - 1 > 0xffffffffu) { fail("Vertex draw range is out of bounds"); return; }
+             maximumIndex = UINT(uint64_t(geo.startVertex) + vertexCount - 1);
+         }
+-        const Program& prog = getProgram(key);
++        if (geo.vertexProgram && (geo.vertexProgram>m_vertexPrograms.size() ||
++                !m_vertexPrograms[geo.vertexProgram-1].live)) { fail("Invalid vertex program draw"); return; }
++        const Program& prog = getProgram(key,geo.vertexProgram);
+         if (!prog.prog) { fail("Draw shader program is unavailable"); return; }
++        if (geo.vertexProgram) {
++            for (const auto& a:m_vertexPrograms[geo.vertexProgram-1].attributes)
++                if (a.type<4 && (prog.activeAttributes&(1u<<a.registerIndex)) &&
++                        (a.offset%4 || (geo.vbStride&&geo.vbStride%4))) {
++                    fail("Unaligned programmable FLOAT input is unsupported"); return;
++                }
++        }
+         if (!vertexFetchesFit(geo, prog, maximumIndex)) { fail("Index references vertex attributes outside the bound vertex buffer"); return; }
+         glUseProgram(prog.prog);
+ 
+         glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer());
+         applyFixedState(s, key);
+         uploadUniforms(prog, s, key);
++        if (geo.vertexProgram) {
++            const auto& slot=m_vertexPrograms[geo.vertexProgram-1];
++            for (unsigned i=0;i<2;i++) {
++                const auto coordinate=s.stages[i].values[D3DTSS_TEXCOORDINDEX];
++                if (coordinate>1) { fail("Programmable texture coordinate selection is unsupported"); return; }
++                if (prog.vertexTexCoordIndex[i]>=0) glUniform1i(prog.vertexTexCoordIndex[i],GLint(coordinate));
++            }
++            glActiveTexture(GL_TEXTURE0+kActiveStages); glBindTexture(GL_TEXTURE_2D,m_vertexConstants);
++            glBindSampler(kActiveStages,0);
++            if (prog.vertexConstants>=0) glUniform1i(prog.vertexConstants,kActiveStages);
++            if (prog.vertexConstantCount>=0) glUniform1i(prog.vertexConstantCount,GLint(slot.constantCount));
++        }
+         if (!bindTextures(prog, s, key)) return;
+-        bindGeometry(geo);
++        bindGeometry(geo,prog);
+ 
+         ++m_drawCount;
+         // The first draw always logs, trace flag or not — the player page
+@@ -952,6 +1041,12 @@ private:
+         for (auto& target : m_targets) if (target.live) {
+             glDeleteFramebuffers(1, &target.framebuffer); glDeleteTextures(1, &target.color); target.live = false;
+         }
++        for (auto& slot:m_vertexPrograms) {
++            for (auto& entry:slot.programs) if (entry.second.prog) glDeleteProgram(entry.second.prog);
++            if (slot.shader) glDeleteShader(slot.shader);
++        }
++        m_vertexPrograms.clear();
++        if (m_vertexConstants) glDeleteTextures(1,&m_vertexConstants); m_vertexConstants=0;
+         for (const auto& entry : m_programs)
+             if (entry.second.prog) glDeleteProgram(entry.second.prog);
+         if (m_vao) glDeleteVertexArrays(1, &m_vao);
+@@ -975,6 +1070,22 @@ private:
+         return value;
+     }
+ 
++    bool ensureVertexConstants() {
++        if (m_vertexConstants) return true;
++        std::vector<float> zeros(8192u*4u,0.0f);
++        GLuint texture=0; glGenTextures(1,&texture); glActiveTexture(GL_TEXTURE0+kActiveStages);
++        glBindTexture(GL_TEXTURE_2D,texture); glBindSampler(kActiveStages,0);
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
++        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,128,64,0,GL_RGBA,GL_FLOAT,zeros.data());
++        if (!texture || glGetError()!=GL_NO_ERROR) {
++            if (texture) glDeleteTextures(1,&texture); fail("Vertex constant texture allocation failed"); return false;
++        }
++        m_vertexConstants=texture; return true;
++    }
++
+     bool vertexFetchesFit(const DrawGeometry& geo, const Program& program, uint32_t maximumIndex) const {
+         const BufferSlot& vb = m_buffers[geo.vb - 1];
+         const VertexLayout& layout = geo.layout;
+@@ -987,6 +1098,16 @@ private:
+             const uint64_t stride = geo.vbStride ? geo.vbStride : bytes;
+             return maximumIndex <= (uint64_t(vb.size) - first - bytes) / stride;
+         };
++        if (geo.vertexProgram) {
++            const auto& slot=m_vertexPrograms[geo.vertexProgram-1];
++            uint32_t declared=0;
++            for (const auto& a:slot.attributes) {
++                declared|=1u<<a.registerIndex;
++                const UINT bytes=a.type==4?4:(a.type+1)*4;
++                if (!fits(a.registerIndex,true,a.offset,bytes)) return false;
++            }
++            return !(program.activeAttributes&~declared);
++        }
+         if (!fits(0, layout.xyz || layout.xyzrhw, layout.offsetPosition, layout.xyzrhw ? 16 : 12) ||
+             !fits(1, layout.normal, layout.offsetNormal, 12) ||
+             !fits(2, layout.diffuse, layout.offsetDiffuse, 4)) return false;
+@@ -1027,13 +1148,14 @@ private:
+         }
+     }
+ 
+-    const Program& getProgram(const ShaderKey& key) {
+-        auto it = m_programs.find(key);
+-        if (it != m_programs.end()) return it->second;
++    const Program& getProgram(const ShaderKey& key,BackendHandle vertex=0) {
++        auto& programs=vertex?m_vertexPrograms[vertex-1].programs:m_programs;
++        auto it = programs.find(key);
++        if (it != programs.end()) return it->second;
+ 
+         Program p;
+         auto src = emitGLSL(key);
+-        GLuint vs = compile(GL_VERTEX_SHADER, src.vertex);
++        GLuint vs = vertex?m_vertexPrograms[vertex-1].shader:compile(GL_VERTEX_SHADER,src.vertex);
+         GLuint fs = compile(GL_FRAGMENT_SHADER, src.fragment);
+         if (vs && fs) {
+             p.prog = glCreateProgram();
+@@ -1050,13 +1172,20 @@ private:
+                 p.prog = 0;
+             }
+         }
+-        if (vs) glDeleteShader(vs);
++        if (vs && !vertex) glDeleteShader(vs);
+         if (fs) glDeleteShader(fs);
+ 
+         if (p.prog) {
+-            const char* attributes[] = {"aPosition", "aNormal", "aColor", "aTex0", "aTex1", "aTex2", "aTex3"};
+-            for (unsigned i = 0; i < 7; ++i)
+-                if (glGetAttribLocation(p.prog, attributes[i]) >= 0) p.activeAttributes |= uint8_t(1u << i);
++            if (vertex) {
++                for (unsigned i=0;i<16;i++) {
++                    char name[24]; std::snprintf(name,sizeof(name),"aVS%u",i);
++                    if (glGetAttribLocation(p.prog,name)>=0) p.activeAttributes|=1u<<i;
++                }
++            } else {
++                const char* attributes[]={"aPosition","aNormal","aColor","aTex0","aTex1","aTex2","aTex3"};
++                for (unsigned i=0;i<7;i++)
++                    if (glGetAttribLocation(p.prog,attributes[i])>=0) p.activeAttributes|=1u<<i;
++            }
+             auto loc = [&](const char* n) { return glGetUniformLocation(p.prog, n); };
+             p.world = loc("uWorld"); p.view = loc("uView"); p.projection = loc("uProjection");
+             p.materialDiffuse = loc("uMaterialDiffuse");
+@@ -1068,6 +1197,9 @@ private:
+             p.viewportSize = loc("uViewportSize");
+             p.viewportOrigin = loc("uViewportOrigin");
+             p.depthEnabled = loc("uDepthEnabled");
++            p.vertexConstants=loc("uVertexConstants"); p.vertexConstantCount=loc("uVertexConstantCount");
++            p.vertexTexCoordIndex[0]=loc("uVertexTexCoordIndex0");
++            p.vertexTexCoordIndex[1]=loc("uVertexTexCoordIndex1");
+             char buf[64];
+             for (int i = 0; i < kActiveStages; ++i) {
+                 std::snprintf(buf, sizeof(buf), "uTex%d", i);
+@@ -1085,7 +1217,7 @@ private:
+                 std::snprintf(buf, sizeof(buf), "uPointLights[%d].range", i); p.pointLights[i].range = loc(buf);
+             }
+         }
+-        return m_programs.emplace(key, p).first->second;
++        return programs.emplace(key,p).first->second;
+     }
+ 
+     void applyFixedState(const StateSnapshot& s, const ShaderKey&) {
+@@ -1279,7 +1411,7 @@ private:
+         }
+     }
+ 
+-    void bindGeometry(const DrawGeometry& geo) {
++    void bindGeometry(const DrawGeometry& geo,const Program& program) {
+         BufferSlot& vb = m_buffers[geo.vb - 1];
+         glBindBuffer(GL_ARRAY_BUFFER, vb.gl);
+         if (geo.ib) {
+@@ -1298,6 +1430,19 @@ private:
+             glVertexAttribPointer(idx, size, type, norm, stride,
+                                   reinterpret_cast<const void*>(base + offset));
+         };
++        if (geo.vertexProgram) {
++            const auto& slot=m_vertexPrograms[geo.vertexProgram-1];
++            for (unsigned i=0;i<16;i++) {
++                const VertexAttribute* found=nullptr;
++                for (const auto& a:slot.attributes) if (a.registerIndex==i) { found=&a; break; }
++                if (!found || !(program.activeAttributes&(1u<<i))) attr(i,4,GL_FLOAT,GL_FALSE,0,false);
++                else attr(i,found->type==4?4:GLint(found->type+1),
++                        found->type==4?GL_UNSIGNED_BYTE:GL_FLOAT,
++                        found->type==4?GL_TRUE:GL_FALSE,found->offset,true);
++            }
++            return;
++        }
++        for (unsigned i=7;i<16;i++) attr(i,4,GL_FLOAT,GL_FALSE,0,false);
+         attr(0, l.xyzrhw ? 4 : 3, GL_FLOAT, GL_FALSE, l.offsetPosition, l.xyz || l.xyzrhw);
+         attr(1, 3, GL_FLOAT, GL_FALSE, l.offsetNormal, l.normal);
+         // D3DCOLOR is BGRA in memory; GLES3 lacks GL_BGRA vertex format, so the
+@@ -1320,7 +1465,7 @@ private:
+     BackendHandle m_currentTarget = 0;
+     bool m_currentDepth = true, m_backbufferDepthAttached = true;
+     GLuint m_boundIB = 0;
+-    bool m_attrOn[8] = {};
++    bool m_attrOn[16] = {};
+     uint64_t m_frame = 0;
+     uint64_t m_drawCount = 0;
+     uint64_t m_clearCount = 0;
+@@ -1333,6 +1478,8 @@ private:
+     std::vector<RenderTargetSlot> m_targets;
+     BackendHandle m_presented = 0; // private GPU snapshot, never a guest target
+     std::unordered_map<ShaderKey, Program, ShaderKeyHash> m_programs;
++    std::vector<VertexProgramSlot> m_vertexPrograms;
++    GLuint m_vertexConstants=0;
+ };
+ 
+ }  // namespace
+diff --git i/d8web/src/core/backend.h w/d8web/src/core/backend.h
+index d60297a..6b53205 100644
+--- i/d8web/src/core/backend.h
++++ w/d8web/src/core/backend.h
+@@ -24,6 +24,10 @@ enum class TexFormat : uint8_t {
+     DXT1, DXT3, DXT5,
+ };
+ 
++// Stream-zero D3D8 declaration input. Types 0..3 are FLOAT1..FLOAT4;
++// type 4 is normalized packed D3DCOLOR. GLSL performs its BGRA swizzle.
++struct VertexAttribute { UINT registerIndex=0, offset=0, type=0, reserved=0; };
++
+ struct DrawGeometry {
+     // Indexed path: vb + ib set. Non-indexed: ib = 0.
+     BackendHandle vb = 0;
+@@ -36,6 +40,7 @@ struct DrawGeometry {
+     UINT startVertex = 0;       // non-indexed path
+     UINT primCount = 0;
+     VertexLayout layout;
++    BackendHandle vertexProgram = 0;
+ };
+ 
+ class IBackend {
+@@ -57,6 +62,15 @@ public:
+                                TexFormat format, const void* data, UINT byteSize) = 0;
+     virtual void destroyTexture(BackendHandle h) = 0;
+ 
++    virtual BackendHandle createVertexProgram(const char* source,
++            const VertexAttribute* attributes, UINT count, UINT constants) {
++        (void)source; (void)attributes; (void)count; (void)constants; return 0;
++    }
++    virtual bool destroyVertexProgram(BackendHandle h) { (void)h; return false; }
++    virtual bool updateVertexConstants(UINT start, const float* data, UINT count) {
++        (void)start; (void)data; (void)count; return false;
++    }
++
+     // Frame
+     virtual void setViewport(const D3DVIEWPORT8& vp) = 0;
+     virtual void clear(bool color, bool depth, bool stencil,

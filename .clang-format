@@ -1,0 +1,28 @@
+---
+# OpenRTW C++ style: readable LLVM-derived formatting at 100 columns.
+# Run: clang-format -i openrtw/core/*.cpp openrtw/core/*.hpp openrtw/platform/**/*.cpp openrtw/tests/*.cpp
+BasedOnStyle: LLVM
+Standard: c++20
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+BreakBeforeBraces: Attach
+PointerAlignment: Left
+SpaceAfterCStyleCast: false
+SpacesBeforeTrailingComments: 1
+AlignTrailingComments: true
+AlignConsecutiveAssignments: false
+BinPackArguments: true
+BinPackParameters: true
+IncludeBlocks: Preserve
+SortIncludes: false
+ReflowComments: false
+...

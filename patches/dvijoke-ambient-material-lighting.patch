@@ -1,0 +1,13 @@
+--- a/d8web/src/backends/webgl2/glsl_emitter.cpp
++++ b/d8web/src/backends/webgl2/glsl_emitter.cpp
+@@ -137,7 +137,9 @@
+         if (key.fogLinear) vs << "  vFogDist = viewPos.z;\n";
+     }
+ 
+-    if (key.lighting) {
++    if (key.lighting && key.directionalLights == 0 && key.pointLights == 0) {
++        vs << "  vColor = vec4(clamp(uGlobalAmbient.rgb * uMaterialAmbient.rgb + uMaterialEmissive.rgb, 0.0, 1.0), clamp(uMaterialDiffuse.a, 0.0, 1.0));\n";
++    } else if (key.lighting) {
+         vs << "  vec3 N = normalize(mat3(uWorld) * aNormal);\n";
+         // Material color sources: COLORVERTEX + COLOR1 handled as: diffuse from
+         // vertex color when present, else material. (Full MCS matrix later.)

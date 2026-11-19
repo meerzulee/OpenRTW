@@ -1,0 +1,50 @@
+diff --git i/d8web/src/backends/webgl2/gl_backend.cpp w/d8web/src/backends/webgl2/gl_backend.cpp
+index 8c06eb2..3b3e311 100644
+--- i/d8web/src/backends/webgl2/gl_backend.cpp
++++ w/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -2,7 +2,6 @@
+ // Dumb translator: StateSnapshot + DrawGeometry in, GLES3/WebGL2 calls out.
+ // WebGL2 gaps handled here:
+ //   - no glDrawElementsBaseVertex → base vertex applied via attribute pointer offsets
+-//   - no GL_TRIANGLE_FAN in indexed form worth trusting → fans converted to lists
+ //   - D3D alpha ref (0..255) normalized to [0,1] uniform
+ 
+ #include "../../core/backend.h"
+@@ -482,12 +481,11 @@ public:
+         if (geo.ib) {
+             GLenum type = geo.index32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
+             UINT indexSize = geo.index32 ? 4 : 2;
+-            if (geo.primitive == D3DPT_TRIANGLEFAN) {
+-                drawFanIndexed(geo, type, indexSize);
+-            } else {
+-                glDrawElements(glPrim(geo.primitive), GLsizei(vertexCount), type,
+-                               reinterpret_cast<const void*>(uintptr_t(geo.startIndex) * indexSize));
+-            }
++            // WebGL2 supports indexed TRIANGLE_FAN directly. The same count,
++            // byte index offset and attribute-based base vertex apply to fans
++            // as to the other indexed primitive modes.
++            glDrawElements(glPrim(geo.primitive), GLsizei(vertexCount), type,
++                           reinterpret_cast<const void*>(uintptr_t(geo.startIndex) * indexSize));
+         } else {
+             if (geo.primitive == D3DPT_TRIANGLEFAN) {
+                 glDrawArrays(GL_TRIANGLE_FAN, GLint(geo.startVertex), GLsizei(vertexCount));
+@@ -785,19 +783,6 @@ private:
+                  i < l.texCoordSets);
+     }
+ 
+-    void drawFanIndexed(const DrawGeometry& geo, GLenum indexType, UINT indexSize) {
+-        // Rare path (some UI). Convert fan to triangle list through a scratch CPU read
+-        // is impossible in WebGL2 (no buffer readback of ELEMENT_ARRAY cheaply), so we
+-        // draw fan via sequential strip-like emulation only when non-indexed. Indexed
+-        // fans get logged; nothing in ZH's hot path uses them.
+-        (void)geo; (void)indexType; (void)indexSize;
+-        static bool warned = false;
+-        if (!warned) {
+-            std::fprintf(stderr, "[d8web] indexed TRIANGLEFAN not implemented (logged once)\n");
+-            warned = true;
+-        }
+-    }
+-
+ #ifdef __EMSCRIPTEN__
+     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE m_ctx = 0;
+ #endif

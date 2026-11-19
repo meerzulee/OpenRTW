@@ -1,0 +1,20 @@
+--- a/d8web/src/backends/webgl2/gl_backend.cpp
++++ b/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -57,9 +57,14 @@
+     const uint16_t c1 = uint16_t(b[2] | (b[3] << 8));
+     uint8_t col[4][4];
+     auto expand565 = [](uint16_t c, uint8_t *o) {
+-        o[0] = uint8_t((((c >> 11) & 31) * 255 + 15) / 31);
+-        o[1] = uint8_t((((c >> 5) & 63) * 255 + 31) / 63);
+-        o[2] = uint8_t(((c & 31) * 255 + 15) / 31);
++        // DXT endpoint expansion is bit replication. Keep this local to
++        // compressed color blocks; uncompressed RGB565 uses its own upload.
++        const uint8_t r = uint8_t((c >> 11) & 31);
++        const uint8_t g = uint8_t((c >> 5) & 63);
++        const uint8_t blue = uint8_t(c & 31);
++        o[0] = uint8_t((r << 3) | (r >> 2));
++        o[1] = uint8_t((g << 2) | (g >> 4));
++        o[2] = uint8_t((blue << 3) | (blue >> 2));
+         o[3] = 255;
+     };
+     expand565(c0, col[0]);

@@ -1,0 +1,345 @@
+diff --git i/d8web/src/backends/webgl2/gl_backend.cpp w/d8web/src/backends/webgl2/gl_backend.cpp
+index ac77e97..dc2a91c 100644
+--- i/d8web/src/backends/webgl2/gl_backend.cpp
++++ w/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -194,6 +194,13 @@ struct TextureSlot {
+     bool live = false;
+ };
+ 
++struct RenderTargetSlot {
++    GLuint framebuffer = 0, color = 0;
++    UINT width = 0, height = 0;
++    UINT storageWidth = 0, storageHeight = 0;
++    bool live = false, primaryDepth = false;
++};
++
+ // D3D sampler state belongs to a texture stage, not the texture resource.
+ // One texture may be bound to both stages with different wrapping/filtering.
+ struct SamplerSlot {
+@@ -334,6 +341,7 @@ public:
+     void resize(int width, int height) override {
+         m_lastError = nullptr;
+         if (!m_initialized || width <= 0 || height <= 0) { fail("Invalid backbuffer dimensions"); return; }
++        if (m_currentTarget) { fail("Cannot resize the primary backbuffer while an offscreen target is selected"); return; }
+         if (!allocateBackbuffer(width, height)) return;
+ #ifdef __EMSCRIPTEN__
+         emscripten_set_canvas_element_size(m_canvasSelector.c_str(), width, height);
+@@ -541,7 +549,7 @@ public:
+         m_viewport = vp;
+         // Rasterize with the same numeric Y direction as D3D. This keeps GL's
+         // lower-edge convention aligned with D3D's top edge without an epsilon.
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_backbuffer);
++        glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer());
+         glViewport(GLint(vp.X), GLint(vp.Y),
+                    GLsizei(vp.Width), GLsizei(vp.Height));
+         glDepthRangef(vp.MinZ, vp.MaxZ);
+@@ -550,7 +558,8 @@ public:
+     void clear(bool color, bool depth, bool stencil,
+                D3DCOLOR argb, float z, DWORD stencilValue) override {
+         m_lastError = nullptr;
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_backbuffer);
++        if ((depth || stencil) && !m_currentDepth) { fail("Selected render target has no depth-stencil attachment"); return; }
++        glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer());
+         GLbitfield mask = 0;
+         if (color) {
+             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+@@ -613,7 +622,7 @@ public:
+         if (!vertexFetchesFit(geo, prog, maximumIndex)) { fail("Index references vertex attributes outside the bound vertex buffer"); return; }
+         glUseProgram(prog.prog);
+ 
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_backbuffer);
++        glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer());
+         applyFixedState(s, key);
+         uploadUniforms(prog, s, key);
+         if (!bindTextures(prog, s, key)) return;
+@@ -656,23 +665,14 @@ public:
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+         glBlitFramebuffer(0, 0, m_width, m_height, 0, m_height, m_width, 0,
+                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_backbuffer);
++        glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer());
+         if (scissor) glEnable(GL_SCISSOR_TEST);
+         if (glGetError() != GL_NO_ERROR) { fail("Backbuffer presentation failed"); return; }
+         ++m_frame;
+     }
+ 
+     bool readPixelsRGBA8(void* dst, UINT bytes, bool topLeft) override {
+-        m_lastError = nullptr;
+-        const uint64_t required = uint64_t(m_width) * uint64_t(m_height) * 4;
+-        if (!m_backbuffer || !dst || required > bytes) { fail("Invalid backbuffer readback range"); return false; }
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_backbuffer);
+-        const GLenum names[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
+-        GLint saved[4];
+-        for (unsigned i = 0; i < 4; ++i) { glGetIntegerv(names[i], &saved[i]); glPixelStorei(names[i], i ? 0 : 1); }
+-        glReadPixels(0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+-        for (unsigned i = 0; i < 4; ++i) glPixelStorei(names[i], saved[i]);
+-        if (glGetError() != GL_NO_ERROR) { fail("Backbuffer readback failed"); return false; }
++        if (!readRenderTargetRGBA8(0, dst, bytes)) return false;
+         if (!topLeft) {
+             auto* data = static_cast<uint8_t*>(dst);
+             const size_t rowBytes = size_t(m_width) * 4;
+@@ -683,10 +683,174 @@ public:
+         return true;
+     }
+ 
++    BackendHandle createRenderTarget(UINT width, UINT height) override {
++        m_lastError = nullptr;
++        GLint maxTexture = 0, maxRenderbuffer = 0, maxViewport[2];
++        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexture); glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRenderbuffer);
++        glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewport);
++        if (!m_initialized || !width || !height || width > UINT(maxTexture) || height > UINT(maxTexture) ||
++                width > UINT(maxRenderbuffer) || height > UINT(maxRenderbuffer) ||
++                width > UINT(maxViewport[0]) || height > UINT(maxViewport[1])) {
++            fail("Render target dimensions exceed the WebGL limits"); return 0;
++        }
++        // Reserve host metadata before creating GL objects so allocation failure
++        // cannot leak a newly allocated framebuffer or color texture.
++        m_targets.reserve(m_targets.size() + 1);
++        GLint oldRead, oldDraw, oldTexture;
++        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead); glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture);
++        RenderTargetSlot target; target.width = target.storageWidth = width; target.height = target.storageHeight = height;
++        glGenFramebuffers(1, &target.framebuffer); glGenTextures(1, &target.color);
++        glBindTexture(GL_TEXTURE_2D, target.color); glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, width, height);
++        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
++        const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++        const GLenum error = glGetError();
++        glBindTexture(GL_TEXTURE_2D, GLuint(oldTexture));
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(oldRead)); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(oldDraw));
++        if (!target.framebuffer || !target.color || !complete || error != GL_NO_ERROR) {
++            glDeleteFramebuffers(1, &target.framebuffer); glDeleteTextures(1, &target.color);
++            fail("Render target framebuffer allocation failed"); return 0;
++        }
++        target.live = true; m_targets.push_back(target); return BackendHandle(m_targets.size());
++    }
++
++    bool destroyRenderTarget(BackendHandle target) override {
++        m_lastError = nullptr;
++        if (!target || target > m_targets.size() || !m_targets[target - 1].live) { fail("Invalid render target"); return false; }
++        if (target == m_currentTarget) { fail("Cannot destroy the selected render target"); return false; }
++        auto& slot = m_targets[target - 1];
++        glDeleteFramebuffers(1, &slot.framebuffer); glDeleteTextures(1, &slot.color); slot.live = false;
++        return true;
++    }
++
++    bool setRenderTarget(BackendHandle target, bool primaryDepth) override {
++        m_lastError = nullptr;
++        GLuint framebuffer, color; UINT width, height;
++        if (!targetInfo(target, framebuffer, color, width, height)) return false;
++        if (primaryDepth && (width > UINT(m_width) || height > UINT(m_height))) {
++            fail("Primary depth surface is smaller than the selected color target"); return false;
++        }
++        if (target && primaryDepth &&
++                (m_targets[target - 1].storageWidth != UINT(m_width) || m_targets[target - 1].storageHeight != UINT(m_height))) {
++            if (!padTargetForPrimaryDepth(target)) return false;
++            if (!targetInfo(target, framebuffer, color, width, height)) return false;
++        }
++        bool& previousDepth = target ? m_targets[target - 1].primaryDepth : m_backbufferDepthAttached;
++        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
++                                  primaryDepth ? m_backbufferDepth : 0);
++        const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++        const GLenum error = glGetError();
++        if (!complete || error != GL_NO_ERROR) {
++            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
++                                      previousDepth ? m_backbufferDepth : 0);
++            glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer());
++            fail("Render target/depth pairing failed"); return false;
++        }
++        previousDepth = primaryDepth; m_currentTarget = target; m_currentDepth = primaryDepth;
++        return true;
++    }
++
++    bool readRenderTargetRGBA8(BackendHandle target, void* dst, UINT bytes) override {
++        m_lastError = nullptr;
++        GLuint framebuffer, color; UINT width, height;
++        if (!targetInfo(target, framebuffer, color, width, height)) return false;
++        if (!dst || uint64_t(width) * height * 4 > bytes) { fail("Invalid render target readback range"); return false; }
++        GLint oldRead, oldPackBuffer;
++        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead); glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &oldPackBuffer);
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer); glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++        const GLenum names[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
++        GLint saved[4];
++        for (unsigned i = 0; i < 4; ++i) { glGetIntegerv(names[i], &saved[i]); glPixelStorei(names[i], i ? 0 : 1); }
++        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, dst);
++        const GLenum error = glGetError();
++        for (unsigned i = 0; i < 4; ++i) glPixelStorei(names[i], saved[i]);
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, GLuint(oldPackBuffer)); glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(oldRead));
++        if (error != GL_NO_ERROR) { fail("Render target readback failed"); return false; }
++        return true;
++    }
++
++    bool updateRenderTargetRGB8(BackendHandle target, UINT x, UINT y, UINT width, UINT height,
++                               const void* data, UINT bytes) override {
++        m_lastError = nullptr;
++        GLuint framebuffer, color; UINT targetWidth, targetHeight;
++        if (!targetInfo(target, framebuffer, color, targetWidth, targetHeight)) return false;
++        if (!data || !width || !height || x > targetWidth || y > targetHeight || width > targetWidth - x ||
++                height > targetHeight - y || uint64_t(width) * height * 3 != bytes) {
++            fail("Render target upload range is invalid"); return false;
++        }
++        GLint oldTexture, oldUnpackBuffer;
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture); glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &oldUnpackBuffer);
++        glBindTexture(GL_TEXTURE_2D, color); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++        const GLenum names[] = {GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_ROWS, GL_UNPACK_SKIP_PIXELS};
++        GLint saved[4];
++        for (unsigned i = 0; i < 4; ++i) { glGetIntegerv(names[i], &saved[i]); glPixelStorei(names[i], i ? 0 : 1); }
++        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_RGB, GL_UNSIGNED_BYTE, data);
++        const GLenum error = glGetError();
++        for (unsigned i = 0; i < 4; ++i) glPixelStorei(names[i], saved[i]);
++        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, GLuint(oldUnpackBuffer)); glBindTexture(GL_TEXTURE_2D, GLuint(oldTexture));
++        if (error != GL_NO_ERROR) { fail("Render target upload failed"); return false; }
++        return true;
++    }
++
+     const char* name() const override { return "webgl2"; }
+     const char* lastError() const override { return m_lastError; }
+ 
+ private:
++    bool padTargetForPrimaryDepth(BackendHandle handle) {
++        // WebGL2 requires identical attachment sizes, while D3D8 permits a
++        // larger depth surface. Preserve the logical color rectangle in a
++        // padded physical RGB8 texture, using a real GPU blit before commit.
++        auto& target = m_targets[handle - 1];
++        GLint oldRead, oldDraw, oldTexture;
++        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead); glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture);
++        const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++        GLuint framebuffer = 0, color = 0;
++        glGenFramebuffers(1, &framebuffer); glGenTextures(1, &color);
++        glBindTexture(GL_TEXTURE_2D, color); glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, m_width, m_height);
++        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_backbufferDepth);
++        bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++        GLenum error = glGetError();
++        if (complete && error == GL_NO_ERROR) {
++            glDisable(GL_SCISSOR_TEST);
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
++            glBlitFramebuffer(0, 0, target.width, target.height, 0, 0, target.width, target.height,
++                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
++            error = glGetError();
++        }
++        if (scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
++        if (!framebuffer || !color || !complete || error != GL_NO_ERROR) {
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(oldRead)); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(oldDraw));
++            glBindTexture(GL_TEXTURE_2D, GLuint(oldTexture));
++            glDeleteFramebuffers(1, &framebuffer); glDeleteTextures(1, &color);
++            fail("Render target padding for shared depth failed"); return false;
++        }
++        const GLuint oldFramebuffer = target.framebuffer, oldColor = target.color;
++        target.framebuffer = framebuffer; target.color = color;
++        target.storageWidth = UINT(m_width); target.storageHeight = UINT(m_height); target.primaryDepth = true;
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(oldRead) == oldFramebuffer ? framebuffer : GLuint(oldRead));
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(oldDraw) == oldFramebuffer ? framebuffer : GLuint(oldDraw));
++        glBindTexture(GL_TEXTURE_2D, GLuint(oldTexture) == oldColor ? color : GLuint(oldTexture));
++        glDeleteFramebuffers(1, &oldFramebuffer); glDeleteTextures(1, &oldColor);
++        return true;
++    }
++
++    GLuint currentFramebuffer() const { return m_currentTarget ? m_targets[m_currentTarget - 1].framebuffer : m_backbuffer; }
++
++    bool targetInfo(BackendHandle target, GLuint& framebuffer, GLuint& color, UINT& width, UINT& height) {
++        if (!target) {
++            if (!m_backbuffer) { fail("Primary backbuffer is unavailable"); return false; }
++            framebuffer = m_backbuffer; color = m_backbufferColor; width = UINT(m_width); height = UINT(m_height); return true;
++        }
++        if (target > m_targets.size() || !m_targets[target - 1].live) { fail("Invalid render target"); return false; }
++        const auto& slot = m_targets[target - 1];
++        framebuffer = slot.framebuffer; color = slot.color; width = slot.width; height = slot.height; return true;
++    }
+     bool allocateBackbuffer(int width, int height) {
+         GLint maximum = 0, oldTexture = 0, oldRenderbuffer = 0;
+         glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maximum);
+@@ -718,6 +882,15 @@ private:
+         if (m_backbufferDepth) glDeleteRenderbuffers(1, &m_backbufferDepth);
+         m_backbuffer = framebuffer; m_backbufferColor = color; m_backbufferDepth = depth;
+         m_width = width; m_height = height;
++        // Depth storage was replaced. Offscreen FBO attachments must not keep
++        // the deleted allocation alive or accidentally use obsolete contents.
++        for (auto& target : m_targets) if (target.live && target.primaryDepth) {
++            glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
++            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
++            target.primaryDepth = false;
++        }
++        m_currentTarget = 0; m_currentDepth = m_backbufferDepthAttached = true;
++        glBindFramebuffer(GL_FRAMEBUFFER, m_backbuffer);
+         return true;
+     }
+ 
+@@ -748,6 +921,9 @@ private:
+             if (texture.live) glDeleteTextures(1, &texture.gl);
+             texture.live = false;
+         }
++        for (auto& target : m_targets) if (target.live) {
++            glDeleteFramebuffers(1, &target.framebuffer); glDeleteTextures(1, &target.color); target.live = false;
++        }
+         for (const auto& entry : m_programs)
+             if (entry.second.prog) glDeleteProgram(entry.second.prog);
+         if (m_vao) glDeleteVertexArrays(1, &m_vao);
+@@ -890,7 +1066,7 @@ private:
+         // separate from any unimplemented low-bit display format.
+         if (s.rs[D3DRS_DITHERENABLE]) glEnable(GL_DITHER); else glDisable(GL_DITHER);
+         // Depth
+-        if (s.rs[D3DRS_ZENABLE]) { glEnable(GL_DEPTH_TEST); glDepthFunc(glCmp(s.rs[D3DRS_ZFUNC])); }
++        if (s.rs[D3DRS_ZENABLE] && m_currentDepth) { glEnable(GL_DEPTH_TEST); glDepthFunc(glCmp(s.rs[D3DRS_ZFUNC])); }
+         else glDisable(GL_DEPTH_TEST);
+         glDepthMask(s.rs[D3DRS_ZWRITEENABLE] ? GL_TRUE : GL_FALSE);
+ 
+@@ -967,7 +1143,7 @@ private:
+         }
+         if (p.viewportOrigin >= 0)
+             glUniform2f(p.viewportOrigin, float(m_viewport.X), float(m_viewport.Y));
+-        if (p.depthEnabled >= 0) glUniform1i(p.depthEnabled, s.rs[D3DRS_ZENABLE] != 0);
++        if (p.depthEnabled >= 0) glUniform1i(p.depthEnabled, s.rs[D3DRS_ZENABLE] != 0 && m_currentDepth);
+         if (p.viewportSize >= 0)
+             glUniform2f(p.viewportSize, float(m_viewport.Width ? m_viewport.Width : m_width),
+                         float(m_viewport.Height ? m_viewport.Height : m_height));
+@@ -1113,6 +1289,8 @@ private:
+     int m_width = 0, m_height = 0;
+     GLuint m_vao = 0;
+     GLuint m_backbuffer = 0, m_backbufferColor = 0, m_backbufferDepth = 0;
++    BackendHandle m_currentTarget = 0;
++    bool m_currentDepth = true, m_backbufferDepthAttached = true;
+     GLuint m_boundIB = 0;
+     bool m_attrOn[8] = {};
+     uint64_t m_frame = 0;
+@@ -1124,6 +1302,7 @@ private:
+     D3DVIEWPORT8 m_viewport{};
+     std::vector<BufferSlot> m_buffers;
+     std::vector<TextureSlot> m_textures;
++    std::vector<RenderTargetSlot> m_targets;
+     std::unordered_map<ShaderKey, Program, ShaderKeyHash> m_programs;
+ };
+ 
+diff --git i/d8web/src/core/backend.h w/d8web/src/core/backend.h
+index 381b358..493cd57 100644
+--- i/d8web/src/core/backend.h
++++ w/d8web/src/core/backend.h
+@@ -78,6 +78,24 @@ public:
+     virtual bool readPixelsRGBA8(void* dst, UINT bytes, bool topLeft) {
+         (void)dst; (void)bytes; (void)topLeft; return false;
+     }
++
++    // Standalone opaque X8 color targets. Handle 0 refers to the primary
++    // backbuffer; optional depth is the existing primary D24S8 allocation.
++    // These defaults keep other backends source-compatible and unsupported.
++    virtual BackendHandle createRenderTarget(UINT width, UINT height) {
++        (void)width; (void)height; return 0;
++    }
++    virtual bool destroyRenderTarget(BackendHandle target) { (void)target; return false; }
++    virtual bool setRenderTarget(BackendHandle target, bool primaryDepth) {
++        (void)target; (void)primaryDepth; return false;
++    }
++    virtual bool readRenderTargetRGBA8(BackendHandle target, void* dst, UINT bytes) {
++        (void)target; (void)dst; (void)bytes; return false;
++    }
++    virtual bool updateRenderTargetRGB8(BackendHandle target, UINT x, UINT y,
++            UINT width, UINT height, const void* data, UINT bytes) {
++        (void)target; (void)x; (void)y; (void)width; (void)height; (void)data; (void)bytes; return false;
++    }
+ };
+ 
+ // Factory implemented per backend translation unit

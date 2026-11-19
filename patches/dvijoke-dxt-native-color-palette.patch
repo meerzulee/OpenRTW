@@ -1,0 +1,30 @@
+--- a/d8web/src/backends/webgl2/gl_backend.cpp
++++ b/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -69,17 +69,24 @@
+     };
+     expand565(c0, col[0]);
+     expand565(c1, col[1]);
++    // Match the measured Wine/Mesa color palette. A negative weighted
++    // difference requires mathematical floor, rather than C++ truncation.
++    auto interpolate = [](uint8_t first, uint8_t second, int weight) {
++        const int product = (int(second) - int(first)) * weight;
++        const int step = product >= 0 ? product / 256 : -((-product + 255) / 256);
++        return uint8_t(int(first) + step);
++    };
+     if (!dxt1 || c0 > c1) {
+         for (int i = 0; i < 3; i++) {
+-            col[2][i] = uint8_t((2 * col[0][i] + col[1][i]) / 3);
+-            col[3][i] = uint8_t((col[0][i] + 2 * col[1][i]) / 3);
++            col[2][i] = interpolate(col[0][i], col[1][i], 85);
++            col[3][i] = interpolate(col[0][i], col[1][i], 170);
+         }
+         col[2][3] = 255;
+         col[3][3] = 255;
+     } else {
+         // DXT1 3-color mode: index 3 = transparent black (punch-through).
+         for (int i = 0; i < 3; i++) {
+-            col[2][i] = uint8_t((col[0][i] + col[1][i]) / 2);
++            col[2][i] = uint8_t((col[0][i] + col[1][i] + 1) / 2);
+             col[3][i] = 0;
+         }
+         col[2][3] = 255;

@@ -1,0 +1,70 @@
+--- a/d8web/src/core/backend.h
++++ b/d8web/src/core/backend.h
+@@ -78,6 +78,11 @@
+     virtual bool readPixelsRGBA8(void* dst, UINT bytes, bool topLeft) {
+         (void)dst; (void)bytes; (void)topLeft; return false;
+     }
++    // Optional device-lifecycle seam: -1 unsupported, 0 usable, 1 context lost.
++    virtual int cooperativeState() const { return -1; }
++    virtual bool readPresentedRGBA8(void* dst, UINT bytes) {
++        (void)dst; (void)bytes; return false;
++    }
+ 
+     // Standalone opaque X8 color targets. Handle 0 refers to the primary
+     // backbuffer; optional depth is the existing primary D24S8 allocation.
+--- a/d8web/src/backends/webgl2/gl_backend.cpp
++++ b/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -659,16 +659,44 @@
+ 
+     void present() override {
+         // Present must not hide a preceding rejected draw diagnostic.
++        if (m_lastError) return;
++        BackendHandle next = m_presented;
++        if (!next || m_targets[next - 1].width != UINT(m_width) ||
++                m_targets[next - 1].height != UINT(m_height)) {
++            next = createRenderTarget(UINT(m_width), UINT(m_height));
++            if (!next) return;
++        }
+         const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+         glDisable(GL_SCISSOR_TEST);
+         glBindFramebuffer(GL_READ_FRAMEBUFFER, m_backbuffer);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_targets[next - 1].framebuffer);
++        glBlitFramebuffer(0, 0, m_width, m_height, 0, 0, m_width, m_height,
++                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+         glBlitFramebuffer(0, 0, m_width, m_height, 0, m_height, m_width, 0,
+                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+         glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer());
+         if (scissor) glEnable(GL_SCISSOR_TEST);
+-        if (glGetError() != GL_NO_ERROR) { fail("Backbuffer presentation failed"); return; }
++        if (glGetError() != GL_NO_ERROR) {
++            if (next != m_presented) destroyRenderTarget(next);
++            fail("Backbuffer presentation failed"); return;
++        }
++        const auto previous = m_presented; m_presented = next;
++        if (previous && previous != next) destroyRenderTarget(previous);
+         ++m_frame;
++    }
++
++    int cooperativeState() const override {
++#ifdef __EMSCRIPTEN__
++        return m_ctx <= 0 ? -1 : emscripten_is_webgl_context_lost(m_ctx) ? 1 : 0;
++#else
++        return m_initialized ? 0 : -1;
++#endif
++    }
++
++    bool readPresentedRGBA8(void* dst, UINT bytes) override {
++        if (!m_presented) { fail("No frame has been presented"); return false; }
++        return readRenderTargetRGBA8(m_presented, dst, bytes);
+     }
+ 
+     bool readPixelsRGBA8(void* dst, UINT bytes, bool topLeft) override {
+@@ -1303,6 +1331,7 @@
+     std::vector<BufferSlot> m_buffers;
+     std::vector<TextureSlot> m_textures;
+     std::vector<RenderTargetSlot> m_targets;
++    BackendHandle m_presented = 0; // private GPU snapshot, never a guest target
+     std::unordered_map<ShaderKey, Program, ShaderKeyHash> m_programs;
+ };
+ 

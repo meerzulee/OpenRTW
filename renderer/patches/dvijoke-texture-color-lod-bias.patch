@@ -1,0 +1,50 @@
+--- a/d8web/src/core/state.h
++++ b/d8web/src/core/state.h
+@@ -62,6 +62,7 @@
+ 
+     // Private runtime texture policy; not D3D state and not a shader-key bit.
+     bool stage0BaseAlpha = false;
++    float stage0ColorLodBias = 0.0f;
+ 
+     DWORD fvf = 0;
+ 
+--- a/d8web/src/backends/webgl2/gl_backend.cpp
++++ b/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -165,7 +165,7 @@
+     GLint globalAmbient = -1, fogColor = -1, fogRange = -1;
+     GLint alphaRef = -1, textureFactor = -1, viewportSize = -1;
+     GLint viewportOrigin = -1, depthEnabled = -1;
+-    GLint stage0BaseAlpha = -1;
++    GLint stage0BaseAlpha = -1, stage0ColorLodBias = -1;
+     GLint tex[kActiveStages] = {-1, -1};
+     GLint texMat[kActiveStages] = {-1, -1};
+     struct { GLint dir = -1, diffuse = -1, ambient = -1; } dirLights[4];
+@@ -1199,6 +1199,7 @@
+             p.viewportOrigin = loc("uViewportOrigin");
+             p.depthEnabled = loc("uDepthEnabled");
+             p.stage0BaseAlpha = loc("uStage0BaseAlpha");
++            p.stage0ColorLodBias = loc("uStage0ColorLodBias");
+             p.vertexConstants=loc("uVertexConstants"); p.vertexConstantCount=loc("uVertexConstantCount");
+             p.vertexTexCoordIndex[0]=loc("uVertexTexCoordIndex0");
+             p.vertexTexCoordIndex[1]=loc("uVertexTexCoordIndex1");
+@@ -1299,6 +1300,7 @@
+         }
+         if (p.alphaRef >= 0) glUniform1f(p.alphaRef, float(s.rs[D3DRS_ALPHAREF] & 0xFF) / 255.0f);
+         if (p.stage0BaseAlpha >= 0) glUniform1i(p.stage0BaseAlpha, s.stage0BaseAlpha);
++        if (p.stage0ColorLodBias >= 0) glUniform1f(p.stage0ColorLodBias, s.stage0ColorLodBias);
+         if (p.textureFactor >= 0) {
+             DWORD t = s.rs[D3DRS_TEXTUREFACTOR];
+             glUniform4f(p.textureFactor, ((t >> 16) & 0xFF) / 255.0f, ((t >> 8) & 0xFF) / 255.0f,
+--- a/d8web/src/backends/webgl2/glsl_emitter.cpp
++++ b/d8web/src/backends/webgl2/glsl_emitter.cpp
+@@ -243,8 +243,10 @@
+         if (key.stages[i].bound) fs << "uniform sampler2D uTex" << i << ";\n";
+     if (key.stages[0].bound) {
+         fs << "uniform bool uStage0BaseAlpha;\n"
++              "uniform float uStage0ColorLodBias;\n"
+               "vec4 sampleStage0(vec2 uv) {\n"
+               "  vec4 sampled = texture(uTex0, uv);\n"
++              "  if (uStage0ColorLodBias != 0.0) sampled.rgb = texture(uTex0, uv, uStage0ColorLodBias).rgb;\n"
+               "  if (uStage0BaseAlpha) sampled.a = textureLod(uTex0, uv, 0.0).a;\n"
+               "  return sampled;\n}\n";
+     }

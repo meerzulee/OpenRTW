@@ -1,0 +1,8 @@
+{
+  "name": "openrtw",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test openrtw/tests/*_tests.mjs"
+  }
+}

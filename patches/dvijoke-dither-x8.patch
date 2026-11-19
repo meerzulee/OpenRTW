@@ -1,0 +1,13 @@
+--- a/d8web/src/backends/webgl2/gl_backend.cpp
++++ b/d8web/src/backends/webgl2/gl_backend.cpp
+@@ -885,6 +885,10 @@
+     }
+ 
+     void applyFixedState(const StateSnapshot& s, const ShaderKey&) {
++        // Honor the requested state even with the opaque RGB8 backbuffer.
++        // The validated X8 vectors keep dithering's driver-dependent scope
++        // separate from any unimplemented low-bit display format.
++        if (s.rs[D3DRS_DITHERENABLE]) glEnable(GL_DITHER); else glDisable(GL_DITHER);
+         // Depth
+         if (s.rs[D3DRS_ZENABLE]) { glEnable(GL_DEPTH_TEST); glDepthFunc(glCmp(s.rs[D3DRS_ZFUNC])); }
+         else glDisable(GL_DEPTH_TEST);

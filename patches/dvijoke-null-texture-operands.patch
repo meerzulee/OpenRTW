@@ -1,0 +1,36 @@
+--- a/d8web/src/core/shaderkey.h
++++ b/d8web/src/core/shaderkey.h
+@@ -101,14 +101,29 @@
+             // No texture bound but ops reference D3DTA_TEXTURE: D3D8 degrades the
+             // stage to a passthrough of the current color, not "texture = white".
+             if (!sk.bound && sk.colorOp != D3DTOP_DISABLE) {
+-                auto refsTexture = [](uint8_t arg) { return (arg & D3DTA_SELECTMASK) == D3DTA_TEXTURE; };
+-                if (refsTexture(sk.colorArg1) || refsTexture(sk.colorArg2)) {
++                auto usesTexture = [](uint8_t op, uint8_t arg1, uint8_t arg2, uint8_t arg0) {
++                    const auto texture = [](uint8_t arg) {
++                        return (arg & D3DTA_SELECTMASK) == D3DTA_TEXTURE;
++                    };
++                    // SELECTARG never reads its other operand. A NULL texture
++                    // there must not erase a selected diffuse/factor value.
++                    if (op == D3DTOP_DISABLE) return false;
++                    if (op == D3DTOP_SELECTARG1) return texture(arg1);
++                    if (op == D3DTOP_SELECTARG2) return texture(arg2);
++                    if (op == D3DTOP_MULTIPLYADD || op == D3DTOP_LERP)
++                        return texture(arg0) || texture(arg1) || texture(arg2);
++                    if (op == D3DTOP_BLENDTEXTUREALPHA)
++                        return true; // These operations read texture alpha implicitly.
++                    return texture(arg1) || texture(arg2);
++                };
++                if (usesTexture(sk.colorOp, sk.colorArg1, sk.colorArg2, sk.colorArg0)) {
+                     sk.colorOp = D3DTOP_SELECTARG2;
+                     sk.colorArg1 = D3DTA_TEXTURE;
+                     sk.colorArg2 = D3DTA_CURRENT;
+                 }
+-                if (sk.alphaOp != D3DTOP_DISABLE &&
+-                    (refsTexture(sk.alphaArg1) || refsTexture(sk.alphaArg2))) {
++                // RGB and alpha fall back independently, and the stage stays
++                // active so subsequent stages continue the native cascade.
++                if (usesTexture(sk.alphaOp, sk.alphaArg1, sk.alphaArg2, sk.alphaArg0)) {
+                     sk.alphaOp = D3DTOP_SELECTARG2;
+                     sk.alphaArg1 = D3DTA_TEXTURE;
+                     sk.alphaArg2 = D3DTA_CURRENT;
